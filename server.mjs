@@ -13,6 +13,7 @@ const DISCORD_PUBLIC_KEY =
   process.env.DISCORD_PUBLIC_KEY || 'fd9dd86cfeb0d94d65b9371d81a83de023bc93b82debc87f9ba449f631401b4c';
 const GUILD_ID = process.env.GUILD_ID || '1540374512812425236';
 const DEFAULT_CHANNEL_ID = '1540375006578737213'; // #🎸-now-listening
+const SERVER_PASSCODE = process.env.SERVER_PASSCODE || 'mag69';
 const HOST_URL = (process.env.HOST_URL || 'https://mag-video-dropzone.onrender.com').replace(/\/+$/, '');
 const PORT = Number(process.env.PORT || 8080);
 const MAX_DISCORD_BYTES = 9.5 * 1024 * 1024; // 9.5 MB Discord free limit safe ceiling
@@ -131,6 +132,10 @@ async function getGuildChannels() {
 }
 
 async function getOrCreateChannelWebhook(channelId) {
+  const validChannels = await getGuildChannels();
+  if (!validChannels.some((c) => c.id === channelId)) {
+    throw new Error('Access denied: Channel does not belong to authorized server.');
+  }
   if (webhookCache.has(channelId)) {
     return webhookCache.get(channelId);
   }
@@ -271,9 +276,47 @@ async function uploadToCatboxFallback(filePath) {
   return url;
 }
 
+function generateAccessToken(userId) {
+  const expires = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+  const payload = `${userId || 'member'}:${GUILD_ID}:${expires}`;
+  const sig = crypto.createHmac('sha256', DISCORD_TOKEN).update(payload).digest('hex');
+  return `${expires}.${sig}`;
+}
+
+function verifyAccessToken(token, userId) {
+  if (!token) return false;
+  if (token === SERVER_PASSCODE) return true;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [expiresStr, sig] = parts;
+  const expires = parseInt(expiresStr, 10);
+  if (isNaN(expires) || Date.now() > expires) return false;
+
+  const payload = `${userId || 'member'}:${GUILD_ID}:${expires}`;
+  const expectedSig = crypto.createHmac('sha256', DISCORD_TOKEN).update(payload).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expectedSig, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function verifyAnyServerAccess(token) {
+  if (!token) return false;
+  if (token === SERVER_PASSCODE) return true;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [expiresStr] = parts;
+  const expires = parseInt(expiresStr, 10);
+  return !isNaN(expires) && Date.now() <= expires;
+}
+
 function buildVidsInteractionResponse(userId, channelId) {
   const targetChannel = channelId || DEFAULT_CHANNEL_ID;
-  const userParam = userId ? `?user=${userId}&channel=${targetChannel}` : `?channel=${targetChannel}`;
+  const token = generateAccessToken(userId);
+  const userParam = userId
+    ? `?user=${userId}&channel=${targetChannel}&token=${token}`
+    : `?channel=${targetChannel}&token=${token}`;
   const dropzoneUrl = `${HOST_URL}/${userParam}`;
 
   return {
@@ -581,6 +624,20 @@ function renderHtmlPage() {
       </div>
     </div>
 
+    <div id="authLockBox" style="display:none; text-align:center; padding: 24px 8px;">
+      <div style="font-size:42px; margin-bottom:12px;">🔒</div>
+      <h2 style="font-size:18px; margin:0 0 8px;">MAGlite 69 Members Only</h2>
+      <p style="font-size:13px; color:var(--muted); line-height:1.5; margin-bottom:20px;">
+        This video dropzone is restricted to members of the MAGlite 69 Discord server.<br/>
+        Type <code>/vids</code> in Discord to get your instant access link, or enter the server passcode below:
+      </p>
+      <div style="display:flex; gap:8px; max-width:280px; margin:0 auto;">
+        <input type="password" id="passcodeInput" placeholder="Server Passcode" style="padding:10px; font-size:14px;" />
+        <button type="button" id="unlockBtn" class="submit-btn" style="margin:0; padding:10px 16px; width:auto;">Unlock</button>
+      </div>
+      <div id="authError" style="color:var(--danger); font-size:12px; margin-top:8px; display:none;">Invalid passcode</div>
+    </div>
+
     <form id="uploadForm">
       <label>1. Who are you?</label>
       <div class="user-grid" id="userGrid"></div>
@@ -618,8 +675,19 @@ function renderHtmlPage() {
 
   <script>
     const params = new URLSearchParams(window.location.search);
+    let accessToken = params.get('token') || localStorage.getItem('mag_access_token') || '';
+    if (params.get('token')) {
+      localStorage.setItem('mag_access_token', params.get('token'));
+    }
+
     let selectedUserId = params.get('user') || localStorage.getItem('mag_user_id') || '336972475906654209';
     const preselectedChannel = params.get('channel') || '${DEFAULT_CHANNEL_ID}';
+
+    const authLockBox = document.getElementById('authLockBox');
+    const uploadForm = document.getElementById('uploadForm');
+    const passcodeInput = document.getElementById('passcodeInput');
+    const unlockBtn = document.getElementById('unlockBtn');
+    const authError = document.getElementById('authError');
 
     const userGrid = document.getElementById('userGrid');
     const channelSelect = document.getElementById('channelSelect');
@@ -639,8 +707,36 @@ function renderHtmlPage() {
       return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
+    unlockBtn.addEventListener('click', async () => {
+      const val = passcodeInput.value.trim();
+      if (!val) return;
+      accessToken = val;
+      localStorage.setItem('mag_access_token', val);
+      const res = await fetch('/api/meta?token=' + encodeURIComponent(accessToken));
+      if (res.ok) {
+        authError.style.display = 'none';
+        init();
+      } else {
+        authError.style.display = 'block';
+      }
+    });
+
     async function init() {
-      const res = await fetch('/api/meta');
+      if (!accessToken) {
+        uploadForm.style.display = 'none';
+        authLockBox.style.display = 'block';
+        return;
+      }
+
+      const res = await fetch('/api/meta?token=' + encodeURIComponent(accessToken));
+      if (!res.ok) {
+        uploadForm.style.display = 'none';
+        authLockBox.style.display = 'block';
+        return;
+      }
+
+      uploadForm.style.display = 'block';
+      authLockBox.style.display = 'none';
       const data = await res.json();
 
       const matchedByName = data.users.find(
@@ -705,7 +801,8 @@ function renderHtmlPage() {
       const url = '/api/upload?userId=' + encodeURIComponent(selectedUserId) +
                   '&channelId=' + encodeURIComponent(channelId) +
                   '&caption=' + encodeURIComponent(caption) +
-                  '&filename=' + encodeURIComponent(file.name);
+                  '&filename=' + encodeURIComponent(file.name) +
+                  '&token=' + encodeURIComponent(accessToken);
 
       xhr.open('POST', url, true);
 
@@ -773,9 +870,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/meta') {
+      const token = url.searchParams.get('token') || req.headers['x-mag-token'];
+      if (!verifyAnyServerAccess(token)) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Unauthorized: MAGlite 69 members only.' }));
+        return;
+      }
       const channels = await getGuildChannels();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ users: KNOWN_USERS, channels }));
+      res.end(JSON.stringify({ ok: true, users: KNOWN_USERS, channels }));
       return;
     }
 
@@ -829,14 +932,31 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/upload') {
-      const userId = url.searchParams.get('userId') || '336972475906654209';
+      const token = url.searchParams.get('token') || req.headers['x-mag-token'];
+      const userId = url.searchParams.get('userId');
       const channelId = url.searchParams.get('channelId') || DEFAULT_CHANNEL_ID;
+
+      if (!verifyAccessToken(token, userId)) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: 'Access denied: You must be a member of MAGlite 69. Type /vids in Discord to access.',
+          })
+        );
+        return;
+      }
+
+      const user = KNOWN_USERS.find((u) => u.id === userId);
+      if (!user) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Access denied: Unknown server member.' }));
+        return;
+      }
+
       const caption = (url.searchParams.get('caption') || '').trim();
       const rawFilename = url.searchParams.get('filename') || 'video.mov';
       const ext = (path.extname(rawFilename) || '.mov').toLowerCase();
-
-      const user =
-        KNOWN_USERS.find((u) => u.id === userId) || KNOWN_USERS[0];
 
       const tempInputPath = path.join(
         os.tmpdir(),
