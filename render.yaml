@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mag-video-dropzone
+    runtime: docker
+    plan: free
+    region: oregon
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        value: "1540374512812425236"
+      - key: PORT
+        value: "8080"
