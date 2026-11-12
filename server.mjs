@@ -9,8 +9,11 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const DISCORD_PUBLIC_KEY =
+  process.env.DISCORD_PUBLIC_KEY || 'fd9dd86cfeb0d94d65b9371d81a83de023bc93b82debc87f9ba449f631401b4c';
 const GUILD_ID = process.env.GUILD_ID || '1540374512812425236';
 const DEFAULT_CHANNEL_ID = '1540375006578737213'; // #🎸-now-listening
+const HOST_URL = (process.env.HOST_URL || 'https://mag-video-dropzone.onrender.com').replace(/\/+$/, '');
 const PORT = Number(process.env.PORT || 8080);
 const MAX_DISCORD_BYTES = 9.5 * 1024 * 1024; // 9.5 MB Discord free limit safe ceiling
 
@@ -266,6 +269,53 @@ async function uploadToCatboxFallback(filePath) {
     throw new Error(`Unexpected response from fallback host: ${url}`);
   }
   return url;
+}
+
+function buildVidsInteractionResponse(userId, channelId) {
+  const targetChannel = channelId || DEFAULT_CHANNEL_ID;
+  const userParam = userId ? `?user=${userId}&channel=${targetChannel}` : `?channel=${targetChannel}`;
+  const dropzoneUrl = `${HOST_URL}/${userParam}`;
+
+  return {
+    type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+    data: {
+      content: `📹 **MAGlite 69 Video Dropzone**\nUpload phone videos (.mov, .mp4) to auto-shrink to 720p HD and post directly into <#${targetChannel}>—no Nitro needed!`,
+      components: [
+        {
+          type: 1, // ACTION_ROW
+          components: [
+            {
+              type: 2, // BUTTON
+              style: 5, // LINK
+              label: 'Open Video Dropzone',
+              url: dropzoneUrl,
+              emoji: { name: '📹' },
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+function verifyDiscordInteraction(rawBody, signature, timestamp, clientPublicKey) {
+  try {
+    return crypto.verify(
+      null,
+      Buffer.concat([Buffer.from(timestamp, 'utf-8'), Buffer.from(rawBody, 'utf-8')]),
+      crypto.createPublicKey({
+        key: Buffer.concat([
+          Buffer.from('302a300506032b6570032100', 'hex'),
+          Buffer.from(clientPublicKey, 'hex'),
+        ]),
+        format: 'der',
+        type: 'spki',
+      }),
+      Buffer.from(signature, 'hex')
+    );
+  } catch {
+    return false;
+  }
 }
 
 function renderHtmlPage() {
@@ -729,6 +779,55 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/interactions') {
+      const signature = req.headers['x-signature-ed25519'];
+      const timestamp = req.headers['x-signature-timestamp'];
+      if (!signature || !timestamp) {
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('Missing signature headers');
+        return;
+      }
+
+      let rawBody = '';
+      req.on('data', (chunk) => {
+        rawBody += chunk;
+      });
+      req.on('end', () => {
+        const isValid = verifyDiscordInteraction(
+          rawBody,
+          signature,
+          timestamp,
+          DISCORD_PUBLIC_KEY
+        );
+        if (!isValid) {
+          res.writeHead(401, { 'Content-Type': 'text/plain' });
+          res.end('Invalid signature');
+          return;
+        }
+
+        const interaction = JSON.parse(rawBody);
+        if (interaction.type === 1) {
+          // PING -> PONG
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 1 }));
+          return;
+        }
+
+        if (interaction.type === 2 && interaction.data?.name === 'vids') {
+          const userId = interaction.member?.user?.id || interaction.user?.id;
+          const channelId = interaction.channel_id;
+          const responseBody = buildVidsInteractionResponse(userId, channelId);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(responseBody));
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 4, data: { content: 'Unknown command' } }));
+      });
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/upload') {
       const userId = url.searchParams.get('userId') || '336972475906654209';
       const channelId = url.searchParams.get('channelId') || DEFAULT_CHANNEL_ID;
@@ -867,6 +966,104 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+function startDiscordGateway() {
+  if (!DISCORD_TOKEN) return;
+
+  let ws = null;
+  let heartbeatTimer = null;
+  let heartbeatAcked = true;
+  let isAlive = true;
+
+  function connect() {
+    console.log('Connecting to Discord Gateway for /vids slash command...');
+    try {
+      ws = new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
+    } catch (err) {
+      console.error('Failed to create WebSocket:', err);
+      setTimeout(connect, 5000);
+      return;
+    }
+
+    ws.onopen = () => {
+      console.log('✅ Connected to Discord Gateway (listening for /vids)...');
+    };
+
+    ws.onmessage = async (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.op === 10) {
+          heartbeatAcked = true;
+          const interval = msg.d.heartbeat_interval;
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
+          heartbeatTimer = setInterval(() => {
+            if (!heartbeatAcked) {
+              console.warn('Gateway heartbeat missed; reconnecting...');
+              try {
+                ws.close();
+              } catch {}
+              return;
+            }
+            heartbeatAcked = false;
+            try {
+              ws.send(JSON.stringify({ op: 1, d: null }));
+            } catch {}
+          }, interval);
+
+          ws.send(
+            JSON.stringify({
+              op: 2,
+              d: {
+                token: DISCORD_TOKEN,
+                intents: 0,
+                properties: { os: 'linux', browser: 'mag-dropzone', device: 'mag-dropzone' },
+              },
+            })
+          );
+        } else if (msg.op === 11) {
+          heartbeatAcked = true;
+        } else if (msg.op === 0 && msg.t === 'INTERACTION_CREATE') {
+          const interaction = msg.d;
+          if (interaction.type === 2 && interaction.data?.name === 'vids') {
+            const userId = interaction.member?.user?.id || interaction.user?.id;
+            const channelId = interaction.channel_id;
+            const responseBody = buildVidsInteractionResponse(userId, channelId);
+
+            await fetch(
+              `https://discord.com/api/v10/interactions/${interaction.id}/${interaction.token}/callback`,
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bot ${DISCORD_TOKEN}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(responseBody),
+              }
+            );
+            console.log(`✅ Handled /vids via Gateway for user ${userId} in #${channelId}`);
+          }
+        }
+      } catch (err) {
+        console.error('Gateway message handler error:', err);
+      }
+    };
+
+    ws.onclose = () => {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (isAlive) {
+        console.log('Gateway closed; reconnecting in 5s...');
+        setTimeout(connect, 5000);
+      }
+    };
+
+    ws.onerror = (err) => {
+      console.error('Gateway WebSocket error:', err.message || err);
+    };
+  }
+
+  connect();
+}
+
 server.listen(PORT, () => {
   console.log(`🎬 24/7 MAGlite 69 Video Dropzone listening on port ${PORT}`);
+  startDiscordGateway();
 });
